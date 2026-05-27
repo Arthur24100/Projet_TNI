@@ -125,7 +125,7 @@ def lire_csv(fichier_csv):
         reader = csv.DictReader(f)
         for row in reader:
             m = row['methode'].strip()
-            if m in ('1', '2', '3', '4'):
+            if m in ('1', '2', '3', '4', '5'):
                 donnees[row['fichier'].strip()] = int(m)
     return donnees
 
@@ -363,6 +363,109 @@ def skull_strip_isolation_cerveau(img_n):
     img_stripped = (img_n * masque).astype(np.float32)
     return img_stripped, masque
 
+def skull_strip_snake_orbites(img_n,
+                              sigma_snake=3,
+                              alpha=0.01, beta=5, gamma=0.001,
+                              rayon_dilation=15,
+                              seuil_gris=150,
+                              seuil_taille_min=100,
+                              seuil_taille_max=10000,
+                              seuil_position=0.28):
+    """
+    Skull stripping — Otsu → ellipse → Snake → suppression orbites.
+
+    Stratégie :
+      1. Normalisation uint8
+      2. Otsu → plus grande région → fill holes = masque tête
+      3. Ellipse ajustée sur le contour → initialisation du snake
+      4. Snake (active contour) → masque intérieur = cerveau brut
+      5. Anneau crâne = tête − snake, dilaté, puis soustrait
+      6. Suppression des orbites : seuillage fixe sur image originale,
+         filtrage par position haute / taille / forme compacte
+    """
+    from skimage.segmentation import active_contour as _active_contour
+    from skimage.filters import gaussian as _gaussian
+    from skimage.draw import polygon as _polygon
+    from skimage import measure as _measure, morphology as _morphology
+
+    h, w = img_n.shape
+
+    # --- Normalisation uint8 ---
+    img_f = img_n.astype(np.float32)
+    mn, mx = img_f.min(), img_f.max()
+    img_8u = ((img_f - mn) / (mx - mn + 1e-8) * 255).astype(np.uint8)
+
+    # ÉTAPE 1 — Otsu → plus grande région → fill holes
+    img_blur = cv2.GaussianBlur(img_8u, (5, 5), 0)
+    seuil_otsu = threshold_otsu(img_blur)
+    mask_bin   = (img_blur > seuil_otsu).astype(np.uint8)
+    labs       = _measure.label(mask_bin)
+    regions    = _measure.regionprops(labs)
+    if not regions:
+        masque = np.ones((h, w), dtype=bool)
+        return img_n.astype(np.float32), masque, None, None
+    plus_grande = max(regions, key=lambda r: r.area)
+    mask_brain  = (labs == plus_grande.label).astype(np.uint8)
+    mask_brain  = binary_fill_holes(mask_brain).astype(np.uint8)
+
+    # ÉTAPE 2 — Ellipse → init snake
+    contours, _ = cv2.findContours(mask_brain, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    cnt = max(contours, key=cv2.contourArea)
+    (cx_e, cy_e), (ax_e, ay_e), _ = cv2.fitEllipse(cnt)
+    s       = np.linspace(0, 2 * np.pi, 400)
+    r_init  = cy_e + (ay_e / 2 * 0.92) * np.sin(s)
+    c_init  = cx_e + (ax_e / 2 * 0.92) * np.cos(s)
+    init_contour = np.array([r_init, c_init]).T
+
+    # ÉTAPE 3 — Snake
+    img_smooth = _gaussian(img_8u, sigma=sigma_snake)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        snake = _active_contour(img_smooth, init_contour,
+                                alpha=alpha, beta=beta, gamma=gamma)
+
+    # ÉTAPE 4 — Masque intérieur snake = cerveau brut
+    mask_interieur = np.zeros((h, w), dtype=np.uint8)
+    rr, cc = _polygon(snake[:, 0], snake[:, 1], (h, w))
+    mask_interieur[rr, cc] = 1
+
+    # ÉTAPE 5 — Suppression du crâne (anneau = tête − snake, dilaté)
+    masque_crane = ((mask_brain == 1) & (mask_interieur == 0)).astype(np.uint8)
+    masque_crane = _morphology.dilation(masque_crane, _morphology.disk(rayon_dilation))
+    masque_crane = (masque_crane * mask_brain).astype(np.uint8)
+    img_sans_crane = img_8u.copy()
+    img_sans_crane[masque_crane == 1] = 0
+
+    # ÉTAPE 6 — Suppression des orbites
+    _, img_thresh = cv2.threshold(img_8u, seuil_gris, 255, cv2.THRESH_BINARY)
+    img_thresh_d  = _morphology.dilation(img_thresh, _morphology.disk(10))
+    labs2         = _measure.label(img_thresh_d)
+    regions2      = _measure.regionprops(labs2)
+    masque_orbites = np.zeros((h, w), dtype=np.uint8)
+    for region in regions2:
+        if region.area < seuil_taille_min:
+            continue
+        cy_r, cx_r  = region.centroid
+        en_avant     = cy_r < h * seuil_position
+        bonne_taille = seuil_taille_min < region.area < seuil_taille_max
+        pas_lateral  = 0.15 * w < cx_r < 0.85 * w
+        minr, minc, maxr, maxc = region.bbox
+        ratio        = (maxc - minc) / (maxr - minr + 1e-5)
+        pas_allonge  = ratio < 4.0
+        if en_avant and bonne_taille and pas_lateral and pas_allonge:
+            masque_orbites[labs2 == region.label] = 1
+    masque_orbites = _morphology.erosion(masque_orbites, _morphology.disk(3))
+    img_final_8u   = img_sans_crane.copy()
+    img_final_8u[masque_orbites == 1] = 0
+
+    # Masque final booléen (cerveau = snake − orbites)
+    masque_final = (mask_interieur.astype(bool)) & (~masque_orbites.astype(bool))
+    img_stripped = (img_n * masque_final).astype(np.float32)
+
+    return img_stripped, masque_final, init_contour, snake
+
+
 def skull_strip(img_n, methode):
     """Applique la méthode de skull stripping choisie."""
     if methode == 1:
@@ -373,8 +476,10 @@ def skull_strip(img_n, methode):
         return skull_strip_coronale(img_n)   # retourne 4 valeurs
     elif methode == 4:
         return skull_strip_isolation_cerveau(img_n) + (None, None)
+    elif methode == 5:
+        return skull_strip_snake_orbites(img_n)      # retourne 4 valeurs
     else:
-        raise ValueError(f"Méthode {methode} invalide (1-4)")
+        raise ValueError(f"Méthode {methode} invalide (1-5)")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -638,7 +743,8 @@ def afficher_resultats(nom, methode, img_n, img_stripped,
 
     noms_methode = {
         1: "Axiale", 2: "Sagittale",
-        3: "Coronale (Snake)", 4: "Watershed"
+        3: "Coronale (Snake)", 4: "Isolation cerveau",
+        5: "Snake + orbites"
     }
 
     fig, axes = plt.subplots(1, 5, figsize=(25, 5))
@@ -791,13 +897,14 @@ def phase_test_batch(fichiers_test):
         print("    1 → Coupe AXIALE       (Otsu + morphologie)")
         print("    2 → Coupe SAGITTALE    (Otsu + Watershed)")
         print("    3 → Coupe CORONALE     (Active Contour / Snake)")
-        print("    4 → Isolation cerveau (robuste toutes vues)")
+        print("    4 → Isolation cerveau  (robuste toutes vues)")
+        print("    5 → Snake + orbites    (Otsu → ellipse → snake → orbites)")
         while True:
             try:
-                methode = int(input("  Votre choix (1-4) : ").strip())
-                if methode in (1, 2, 3, 4):
+                methode = int(input("  Votre choix (1-5) : ").strip())
+                if methode in (1, 2, 3, 4, 5):
                     break
-                print("  ⚠  Entrez 1, 2, 3 ou 4.")
+                print("  ⚠  Entrez 1, 2, 3, 4 ou 5.")
             except ValueError:
                 print("  ⚠  Entrez un nombre entier.")
 
@@ -915,7 +1022,8 @@ MENU = """
 ║    1 → Coupe AXIALE       (Otsu + morphologie)                  ║
 ║    2 → Coupe SAGITTALE    (Otsu + Watershed)                    ║
 ║    3 → Coupe CORONALE     (Active Contour / Snake)              ║
-║    4 → Isolation cerveau (robuste toutes vues)                                       ║
+║    4 → Isolation cerveau  (robuste toutes vues)                 ║
+║    5 → Snake + orbites    (Otsu → ellipse → snake → orbites)    ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -972,13 +1080,14 @@ def main():
         print("    1 → Coupe AXIALE       (Otsu + morphologie)")
         print("    2 → Coupe SAGITTALE    (Otsu + Watershed)")
         print("    3 → Coupe CORONALE     (Active Contour / Snake)")
-        print("    4 → Isolation cerveau (robuste toutes vues)")
+        print("    4 → Isolation cerveau  (robuste toutes vues)")
+        print("    5 → Snake + orbites    (Otsu → ellipse → snake → orbites)")
         while True:
             try:
-                methode = int(input("\n  Votre choix (1-4) : ").strip())
-                if methode in (1, 2, 3, 4):
+                methode = int(input("\n  Votre choix (1-5) : ").strip())
+                if methode in (1, 2, 3, 4, 5):
                     break
-                print("  ⚠  Entrez 1, 2, 3 ou 4.")
+                print("  ⚠  Entrez 1, 2, 3, 4 ou 5.")
             except ValueError:
                 print("  ⚠  Entrez un nombre entier.")
 

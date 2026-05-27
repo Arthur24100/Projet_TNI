@@ -9,7 +9,8 @@
 ║    1 → Coupe AXIALE                                                         ║
 ║    2 → Coupe SAGITTALE                                                      ║
 ║    3 → Coupe CORONALE                                                       ║
-║    4 → Watershed AMÉLIORÉ                                                   ║
+║    4 → Isolation cerveau  (robuste toutes vues)                             ║
+║    5 → Snake + orbites    (Otsu → ellipse → snake → orbites)                ║
 ║    0 → Ignorer cette image (ne sera pas utilisée)                          ║
 ║                                                                              ║
 ║  Résultat : fichier coupes.csv                                              ║
@@ -110,10 +111,12 @@ def afficher_image(img_n, nom, numero, total, deja_faites):
         "  3 → CORONALE\n"
         "      (vue de face,\n"
         "       symétrie gauche/droite)\n\n"
-        "  4 → WATERSHED\n"
-        "      (coupes complexes)\n\n"
+        "  4 → ISOLATION CERVEAU\n"
+        "      (robuste toutes vues)\n\n"
+        "  5 → SNAKE + ORBITES\n"
+        "      (Otsu → ellipse → snake)\n\n"
         "  0 → IGNORER\n"
-        "      (image inutilisable - 559)\n\n"
+        "      (image inutilisable)\n\n"
         "─────────────────────────\n"
         "Fermez la fenêtre\n"
         "puis tapez votre choix."
@@ -141,7 +144,8 @@ def saisir_choix(nom):
         '1': 'AXIALE',
         '2': 'SAGITTALE',
         '3': 'CORONALE',
-        '4': 'WATERSHED',
+        '4': 'ISOLATION CERVEAU',
+        '5': 'SNAKE + ORBITES',
         '0': 'IGNORÉE',
     }
     while True:
@@ -149,12 +153,12 @@ def saisir_choix(nom):
             choix = input(
                 f"\n  {nom}\n"
                 "  Coupe → 1=Axiale  2=Sagittale  3=Coronale  "
-                "4=Watershed  0=Ignorer : "
+                "4=Isolation  5=Snake+Orbites  0=Ignorer : "
             ).strip()
-            if choix in ('0', '1', '2', '3', '4'):
+            if choix in ('0', '1', '2', '3', '4', '5'):
                 print(f"  ✓ Assigné : {noms_methode[choix]}")
                 return choix
-            print("  ⚠  Entrez 0, 1, 2, 3 ou 4.")
+            print("  ⚠  Entrez 0, 1, 2, 3, 4 ou 5.")
         except (ValueError, KeyboardInterrupt):
             print("\n  ⚠  Interruption — progression sauvegardée dans le CSV.")
             raise
@@ -242,17 +246,17 @@ def main():
     print(f"  BILAN LABELLISATION")
     print(f"{'═'*60}")
 
-    compteurs = {'1': 0, '2': 0, '3': 0, '4': 0, '0': 0}
+    compteurs = {'1': 0, '2': 0, '3': 0, '4': 0, '5': 0, '0': 0}
     for v in resultats.values():
         if v in compteurs:
             compteurs[v] += 1
 
     noms = {'1': 'Axiale', '2': 'Sagittale', '3': 'Coronale',
-            '4': 'Watershed', '0': 'Ignorées'}
+            '4': 'Isolation cerv.', '5': 'Snake+Orbites', '0': 'Ignorées'}
     for k, n in noms.items():
         print(f"  {n:<12} : {compteurs[k]:>3} images")
 
-    total_utiles = sum(compteurs[k] for k in ('1','2','3','4'))
+    total_utiles = sum(compteurs[k] for k in ('1','2','3','4','5'))
     print(f"  {'─'*25}")
     print(f"  {'Total utiles':<12} : {total_utiles:>3} images")
     print(f"\n  ✓ CSV sauvegardé : {FICHIER_CSV}")
