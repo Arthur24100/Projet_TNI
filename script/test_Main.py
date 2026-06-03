@@ -45,10 +45,24 @@ SEUIL_RF        = 0.50
 # chargement 
 
 def normaliser(img):
+    """
+    Normalise une image entre 0 et 1.
+    Entree  : img (numpy array float)
+    Sortie  : image normalisee entre 0 et 1
+    """
     mn, mx = img.min(), img.max()
     return (img - mn) / (mx - mn + 1e-8)
 
 def charger_mat(chemin):
+    """
+    Charge un fichier .mat et retourne l'image,
+    le masque ground truth et le label de type de tumeur.
+    Entree  : chemin vers le fichier .mat
+    Sortie  : (img_n, mask_gt, label_tumor)
+              img_n : image normalisee (float32)
+              mask_gt : masque binaire de la tumeur (bool) ou None
+              label_tumor : type de tumeur : 1=meningiome, 2=gliome, 3=pituitaire
+    """
     with h5py.File(chemin, 'r') as f:
         img = np.array(f['cjdata']['image']).T.astype(np.float32)
         try:
@@ -62,6 +76,11 @@ def charger_mat(chemin):
     return normaliser(img), mask_gt, label_tumor
 
 def lister_fichiers(dossiers):
+    """
+    Liste tous les fichiers .mat dans une liste de dossiers.
+    Entree  : dossiers (list of str)
+    Sortie  : liste de chemins complets vers les .mat
+    """
     fichiers = []
     for d in dossiers:
         if os.path.isdir(d):
@@ -71,6 +90,11 @@ def lister_fichiers(dossiers):
     return fichiers
 
 def lire_csv(fichier_csv):
+    """
+    Lit le fichier CSV contenant les paires (fichier, methode de skull stripping).
+    Entree  : fichier_csv (str), chemin vers coupes.csv
+    Sortie  : dict {chemin_fichier,  methode (int 1-5)}
+    """
     donnees = {}
     if not os.path.isfile(fichier_csv):
         return donnees
@@ -82,21 +106,28 @@ def lire_csv(fichier_csv):
                 donnees[row['fichier'].strip()] = int(m)
     return donnees
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  2. PRÉTRAITEMENT CLAHE
-# ══════════════════════════════════════════════════════════════════════════════
+# pretraitement clache
 
 def preprocess(img_n):
+    """
+    Applique un egalisation adaptative d'histogramme (CLAHE) pour ameliorer
+    le contraste local de l'image IRM.
+    Entree  : img_n (float32 normalise 0-1)
+    Sortie  : image pretraitee (float32 normalise 0-1)
+    """
     img_u8 = (img_n * 255).astype(np.uint8)
     clahe  = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
     out    = clahe.apply(img_u8)
     return out.astype(np.float32) / 255.0
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  3. SKULL STRIPPING — 5 méthodes
-# ══════════════════════════════════════════════════════════════════════════════
+# délimitation du crâne 5 méthodes :
 
 def _masque_tete(img_lisse):
+    """
+    Cree un masque binaire de la tete entiere par seuillage Otsu.
+    Entree  : img_lisse = image gaussienne lissee
+    Sortie  : masque binaire de la tete (bool)
+    """
     thresh  = threshold_otsu(img_lisse)
     binaire = img_lisse > thresh * 0.5
     binaire = closing(binaire, disk(8))
@@ -109,6 +140,12 @@ def _masque_tete(img_lisse):
     return binary_fill_holes(masque)
 
 def _rayon_erosion(masque, facteur=0.09):
+    """
+    Calcule un rayon d'erosion adaptatif en fonction de la taille du masque.
+    Entree  : masque  = masque binaire
+              facteur = fraction de la plus petite dimension
+    Sortie  : rayon d'erosion (int, minimum 5)
+    """
     props = regionprops(label(masque))
     if not props:
         return 5
@@ -118,6 +155,13 @@ def _rayon_erosion(masque, facteur=0.09):
     return max(5, int(min(h, w) * facteur))
 
 def _composant_du_seed(masque, cy, cx):
+    """
+    Extrait la composante connexe contenant le point (cy, cx).
+    Si le point est hors masque, retourne la plus grande composante.
+    Entree  : masque binaire
+              cy, cx : coordonnees du point seed
+    Sortie  : masque de la composante selectionnee (bool)
+    """
     etiq = label(masque)
     lbl  = etiq[cy, cx]
     if lbl != 0:
@@ -128,6 +172,12 @@ def _composant_du_seed(masque, cy, cx):
     return masque
 
 def _retirer_petits(masque, seuil=0.05):
+    """
+    Supprime les petites composantes connexes (moins de 5% de la plus grande).
+    Entree  : masque = masque binaire
+              seuil  = fraction minimale de la plus grande composante
+    Sortie  : masque nettoye (bool)
+    """
     etiq  = label(masque)
     props = regionprops(etiq)
     if len(props) <= 1:
@@ -139,7 +189,14 @@ def _retirer_petits(masque, seuil=0.05):
             masque[etiq == p.label] = False
     return masque
 
+
 def skull_strip_axiale(img_n):
+    """
+    Skull stripping pour coupe axiale (vue du dessus).
+    Methode : erosion Otsu + seed au barycentre du tissu cerebral.
+    Entree  : img_n (float32 normalise)
+    Sortie  : (img_strippee, masque_cerveau)
+    """
     H, W     = img_n.shape
     img_l    = gaussian_filter(img_n, sigma=2)
     mt       = _masque_tete(img_l)
@@ -157,6 +214,13 @@ def skull_strip_axiale(img_n):
     return (img_n * mc).astype(np.float32), mc
 
 def skull_strip_sagittale(img_n):
+    """
+    Skull stripping pour coupe sagittale (vue de profil).
+    Methode : Watershed avec marqueurs interieur/exterieur.
+    Garde bien le bas du cerveau (cervelet).
+    Entree  : img_n (float32 normalise)
+    Sortie  : (img_strippee, masque_cerveau)
+    """
     H, W     = img_n.shape
     img_l    = gaussian_filter(img_n, sigma=10)
     mt       = _masque_tete(img_l)
@@ -181,6 +245,13 @@ def skull_strip_sagittale(img_n):
     return (img_n * mf).astype(np.float32), mf
 
 def skull_strip_coronale(img_n):
+    """
+    Skull stripping pour coupe coronale (vue de face).
+    Methode : ellipse initiale + active contour (snake).
+    Attention : peut couper les tumeurs basses -> preferer m4 dans ce cas.
+    Entree  : img_n (float32 normalise)
+    Sortie  : (img_strippee, masque_cerveau)
+    """
     H, W         = img_n.shape
     img_l        = gaussian_filter(img_n, sigma=5)
     mt           = _masque_tete(img_l)
@@ -219,6 +290,12 @@ def skull_strip_coronale(img_n):
     return (img_n * ms).astype(np.float32), ms
 
 def skull_strip_isolation(img_n):
+    """
+    Skull stripping par isolation du cerveau via detection du scalp.
+    Methode robuste, recommandee pour les grosses tumeurs ou tumeurs basses.
+    Entree  : img_n (float32 normalise)
+    Sortie  : (img_strippee, masque_cerveau)
+    """
     mn, mx  = img_n.min(), img_n.max()
     img_u8  = ((img_n - mn) / (mx - mn + 1e-8) * 255).astype(np.uint8)
     img_fil = cv2.medianBlur(img_u8, 5)
@@ -273,7 +350,13 @@ def skull_strip_isolation(img_n):
     return (img_n * masque_c.astype(bool)).astype(np.float32), masque_c.astype(bool)
 
 def supprimer_orbites_masque(img_n, masque):
-    """Supprime les orbites du masque cerveau."""
+    """
+    Supprime les orbites (yeux) du masque cerveau pour les coupes axiales.
+    Utilise des criteres de position (haut de l'image), taille et forme.
+    Entree  : img_n  = image normalisee
+              masque = masque cerveau binaire
+    Sortie  : masque nettoye sans les orbites (bool)
+    """
     img_u8 = (img_n * 255).astype(np.uint8)
     _, img_thr = cv2.threshold(img_u8, 150, 255, cv2.THRESH_BINARY)
     from skimage.morphology import dilation as sk_dil, erosion as sk_eros
@@ -296,6 +379,12 @@ def supprimer_orbites_masque(img_n, masque):
     return masque_propre
 
 def skull_strip_snake_orbites(img_n):
+    """
+    Skull stripping avec active contour (snake) + suppression des orbites.
+    Specifiquement concu pour les coupes axiales avec orbites visibles.
+    Entree  : img_n (float32 normalise)
+    Sortie  : (img_strippee, masque_cerveau)
+    """
     h, w    = img_n.shape
     mn, mx  = img_n.min(), img_n.max()
     img_8u  = ((img_n - mn) / (mx - mn + 1e-8) * 255).astype(np.uint8)
@@ -343,7 +432,14 @@ def skull_strip_snake_orbites(img_n):
     return (img_n * masque_fin).astype(np.float32), masque_fin
 
 def skull_strip(img_n, methode, pour_train=False):
-    """pour_train=True → remplace méthode 5 par 4 (plus rapide)."""
+    """
+    Applique la methode de skull stripping choisie.
+    En entrainement, remplace la methode 5 par la methode 4 (plus rapide).
+    Entree  : img_n  = image normalisee
+              methode = int 1 a 5
+              pour_train = bool, True pendant l'entrainement
+    Sortie  : (img_strippee, masque_cerveau)
+    """
     if pour_train and methode == 5:
         methode = 4
     if methode == 1:
@@ -364,11 +460,26 @@ def skull_strip(img_n, methode, pour_train=False):
     
     return img_s, masque
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  4. FEATURES ENRICHIES — 24 features
-# ══════════════════════════════════════════════════════════════════════════════
+# features : 24
 
 def extraire_features(img_n, masque_cerveau, label_tumor=1):
+    """
+    Extrait 24 features radiomiques par pixel dans le masque cerveau :
+      - 6  : intensite multi-echelle (I, moyennes 3/7/15, variances 3/7)
+      - 2  : gradient Sobel + Laplacien
+      - 4  : filtres Gabor (2 frequences x 2 orientations)
+      - 2  : LBP rayon 1 et 2
+      - 3  : texture locale (energie, contraste, entropie)
+      - 1  : asymetrie gauche/droite
+      - 1  : distance au centre du cerveau
+      - 2  : K-means tissus (3 clusters)
+      - 2  : position normalisee (row, col)
+      - 1  : type de tumeur encode
+    Entree  : img_n = image normalisee
+              masque_cerveau = masque binaire du cerveau
+              label_tumor = type de tumeur (1/2/3)
+    Sortie  : (X, idx) avec X de forme (N, 24) et idx les indices des pixels
+    """
     H, W = img_n.shape
     idx  = np.where(masque_cerveau)
 
@@ -443,11 +554,18 @@ def extraire_features(img_n, masque_cerveau, label_tumor=1):
 
     return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0), idx
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  5. POST-TRAITEMENT
-# ══════════════════════════════════════════════════════════════════════════════
+# post traitement 
 
 def postprocess_mask(pred_mask, label_tumor=1):
+    """
+    Applique un post-traitement morphologique adapte au type de tumeur :
+      - meningiome (1) : fermeture forte + dilatation
+      - gliome (2) : fermeture legere, pas de dilatation (contours flous)
+      - pituitaire (3) : fermeture + dilatation
+    Entree  : pred_mask = masque de prediction binaire
+              label_tumor = type de tumeur (1/2/3)
+    Sortie  : masque post-traite (numpy uint8)
+    """
     params = {
     1: {"ck": 9,  "ci": 1, "dk": 5,  "di": 1},
     2: {"ck": 3,  "ci": 1, "dk": 0,  "di": 0},  # gliome
@@ -468,11 +586,16 @@ def postprocess_mask(pred_mask, label_tumor=1):
         biggest = cv2.dilate(biggest, kd, iterations=p["di"])
     return biggest
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  6. ENTRAÎNEMENT
-# ══════════════════════════════════════════════════════════════════════════════
+# entrainement 
 
 def phase_entrainement(donnees_csv):
+    """
+    Entraine les modeles Random Forest et SVM sur les images du CSV.
+    Pour chaque image : skull stripping, extraction features, echantillonnage,
+    equilibre tumeur/sain et entrainement.
+    Les modeles sont sauvegardes dans DOSSIER_MODELES.
+    Entree  : donnees_csv = dict {chemin a methode}
+    """
     os.makedirs(DOSSIER_MODELES, exist_ok=True)
     fichiers_train = list(donnees_csv.keys())
 
@@ -573,11 +696,19 @@ def phase_entrainement(donnees_csv):
     joblib.dump(svm, os.path.join(DOSSIER_MODELES, 'svm.joblib'))
     print(f"  ✓ SVM sauvegardé → '{DOSSIER_MODELES}/'")
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  7. PRÉDICTION avec predict_proba + seuil calibré
-# ══════════════════════════════════════════════════════════════════════════════
+# prédiction
 
 def predire(img_s, masque, label_tumor, modele, seuil=SEUIL_RF):
+    """
+    Predit le masque de tumeur avec un modele donne.
+    Utilise predict_proba avec seuil calibre + post-traitement morphologique.
+    Entree  : img_s = image apres skull stripping
+              masque = masque cerveau
+              label_tumor = type de tumeur
+              modele = RF ou SVM entraine
+              seuil = seuil de probabilite (defaut SEUIL_RF)
+    Sortie  : masque de prediction (bool)
+    """
     H, W          = img_s.shape
     features, idx = extraire_features(img_s, masque, label_tumor)
 
@@ -597,6 +728,12 @@ def predire(img_s, masque, label_tumor, modele, seuil=SEUIL_RF):
     return masque_pred.astype(bool)
 
 def calculer_metriques(masque_pred, mask_gt):
+    """
+    Calcule les metriques de segmentation : Dice, Precision, Rappel.
+    Entree  : masque_pred = masque predit (bool)
+              mask_gt= masque ground truth (bool)
+    Sortie  : dict avec cles 'Dice', 'Precision', 'Rappel'
+    """
     inter     = (masque_pred & mask_gt).sum()
     dice      = 2 * inter / (masque_pred.sum() + mask_gt.sum() + 1e-8)
     precision = inter / (masque_pred.sum() + 1e-8)
@@ -605,12 +742,17 @@ def calculer_metriques(masque_pred, mask_gt):
             "Précision": float(precision),
             "Rappel": float(rappel)}
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  8. AFFICHAGE AMÉLIORÉ — contours colorés bien visibles
-# ══════════════════════════════════════════════════════════════════════════════
+# affichage 
 
 def dessiner_contour(img_rgb, masque, couleur, epaisseur=2):
-    """Dessine le contour d'un masque binaire sur une image RGB."""
+    """
+    Dessine le contour d'un masque binaire sur une image RGB.
+    Entree  : img_rgb = image RGB (numpy uint8)
+              masque = masque binaire
+              couleur = tuple BGR (ex: (255, 50, 50))
+              epaisseur = epaisseur du contour en pixels
+    Sortie  : image avec contour dessine (numpy uint8)
+    """
     if masque is None or masque.sum() == 0:
         return img_rgb
     m      = masque.astype(np.uint8) * 255
@@ -622,6 +764,18 @@ def dessiner_contour(img_rgb, masque, couleur, epaisseur=2):
 def afficher_resultats(nom, methode, img_n, img_s,
                        masque_rf, masque_svm, mask_gt,
                        met_rf, met_svm):
+    """
+    Affiche les 5 colonnes de resultats :
+      1. Image originale
+      2. Image apres skull stripping
+      3. Prediction RF  + GT 
+      4. Prediction SVM  + GT 
+      5. Comparaison RF + SVM + GT
+    Entree  : nom, methode, img_n, img_s = infos image
+              masque_rf, masque_svm = masques predits
+              mask_gt = ground truth
+              met_rf, met_svm = dict metriques
+    """
     noms_m = {1:"Axiale", 2:"Sagittale", 3:"Coronale",
               4:"Isolation", 5:"Snake+orbites"}
 
@@ -633,7 +787,7 @@ def afficher_resultats(nom, methode, img_n, img_s,
     img_orig_rgb = to_rgb8(img_n)
     img_ss_rgb   = to_rgb8(img_s)
 
-    # ── Image 3 : RF avec remplissage semi-transparent + contour ─────────────
+    # Random Forest avec remplissage semi-transparent + contour 
     img_rf = img_ss_rgb.copy().astype(np.float32)
     if masque_rf is not None and masque_rf.sum() > 0:
         img_rf[masque_rf] = img_rf[masque_rf] * 0.5 + np.array([255, 50, 50]) * 0.5
@@ -644,7 +798,7 @@ def afficher_resultats(nom, methode, img_n, img_s,
     img_rf = dessiner_contour(img_rf, masque_rf, (255, 50, 50), 2)
     img_rf = dessiner_contour(img_rf, mask_gt,   (50, 255, 50), 2)
 
-    # ── Image 4 : SVM ──────────────────────────────────────────────────────
+    # SVM 
     img_svm = img_ss_rgb.copy().astype(np.float32)
     if masque_svm is not None and masque_svm.sum() > 0:
         img_svm[masque_svm] = img_svm[masque_svm] * 0.5 + np.array([50, 100, 255]) * 0.5
@@ -654,7 +808,7 @@ def afficher_resultats(nom, methode, img_n, img_s,
     img_svm = dessiner_contour(img_svm, masque_svm, (50, 100, 255), 2)
     img_svm = dessiner_contour(img_svm, mask_gt,    (50, 255, 50),  2)
 
-    # ── Image 5 : Comparaison RF + SVM + GT ────────────────────────────────
+    # Comparaison RF + SVM + GT 
     img_comp = img_ss_rgb.copy().astype(np.float32)
     if masque_rf is not None and masque_rf.sum() > 0:
         img_comp[masque_rf] = img_comp[masque_rf] * 0.6 + np.array([255, 50, 50]) * 0.4
@@ -667,7 +821,7 @@ def afficher_resultats(nom, methode, img_n, img_s,
     img_comp = dessiner_contour(img_comp, masque_svm, (50, 100, 255), 2)
     img_comp = dessiner_contour(img_comp, mask_gt,    (50, 255, 50),  2)
 
-    # ── Plot ──────────────────────────────────────────────────────────────
+    #Plot
     fig, axes = plt.subplots(1, 5, figsize=(26, 5.5))
     fig.patch.set_facecolor('#1a1a2e')
     fig.suptitle(
@@ -705,8 +859,14 @@ def afficher_resultats(nom, methode, img_n, img_s,
     plt.show()
 
 def afficher_bilan(nom, met_rf, met_svm):
+    """
+    Affiche le tableau de metriques RF vs SVM pour une image.
+    Avertit si le Dice est inferieur a 0.3 sur un des modeles.
+    Entree  : nom = nom du fichier
+              met_rf = dict metriques RF
+              met_svm = dict metriques SVM
+    """
 
-    # Warning si Dice faible
     # Warning si Dice faible
     if met_rf is not None:
         dice_rf  = met_rf['Dice']
@@ -716,7 +876,7 @@ def afficher_bilan(nom, met_rf, met_svm):
         elif dice_rf < 0.3:
             print("   RF : Dice faible — préférer le résultat SVM pour cette image")
         elif dice_svm < 0.3:
-            print("  ⚠SVM : Dice faible — préférer le résultat RF pour cette image")
+            print("  SVM : Dice faible — préférer le résultat RF pour cette image")
         for k in ('Dice', 'Précision', 'Rappel'):
             rf_v  = f"{met_rf[k]:.4f}"  if met_rf  else "N/A"
             svm_v = f"{met_svm[k]:.4f}" if met_svm else "N/A"
@@ -726,15 +886,23 @@ def afficher_bilan(nom, met_rf, met_svm):
             print(f"  {k:<12} {rf_v:>15} {svm_v:>15}{emoji}")
         print(f"{'═'*55}\n")
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  9. PHASE TEST
-# ══════════════════════════════════════════════════════════════════════════════
+# test
 
 def phase_test(fichiers_test):
+    """
+    Lance le test interactif sur les images hors CSV.
+    Pour chaque image :
+      1. Affiche l'image pour identifier le type de coupe
+      2. Demande la methode de skull stripping a l'utilisateur
+      3. Predit avec RF et SVM
+      4. Affiche les metriques et les visualisations
+    Affiche un bilan global a la fin.
+    Entree  : fichiers_test = liste de chemins vers les .mat de test
+    """
     chemin_rf  = os.path.join(DOSSIER_MODELES, 'random_forest.joblib')
     chemin_svm = os.path.join(DOSSIER_MODELES, 'svm.joblib')
     if not os.path.isfile(chemin_rf):
-        print("  ✗ Modèles non trouvés. Lance d'abord --train")
+        print("   Modèles non trouvés. Lance d'abord --train")
         return
 
     rf  = joblib.load(chemin_rf)
@@ -769,16 +937,16 @@ def phase_test(fichiers_test):
         print(f"\n{'─'*55}")
         print(f"  Image {i+1}/{len(fichiers_test)} : {nom}")
         print(f"{'─'*55}")
-        print("    1→Axiale  2→Sagittale  3→Coronale")
-        print("    4→Isolation cerveau  5→Snake+orbites")
+        print("    1: Axiale  2: Sagittale  3: Coronale")
+        print("    4: Isolation cerveau  5: Snake+orbites")
         print("    Axiale    : vue du dessus                           ")
-        print("               → m1 standard | m5 si orbites visibles  ")
+        print("               (m1 standard et m5 si orbites visibles)  ")
         print("    Sagittale : vue de profil                          ")
-        print("               → m2 si tumeur normale ou basse         ")
-        print("               → m4 si grosse tumeur                   ")
+        print("               (m2 si tumeur normale ou basse)         ")
+        print("                (m4 si grosse tumeur )                  ")
         print("   Coronale  : vue de face                             ")
-        print("              → m3 si tumeur haute                    ")
-        print("              → m4 si tumeur basse                    ")
+        print("              (m3 si tumeur haute)                    ")
+        print("              (m4 si tumeur basse )                   ")
         
         while True:
             try:
@@ -838,17 +1006,19 @@ def phase_test(fichiers_test):
         print(f"\n  Meilleur modèle : {winner} ✓")
         print(f"{'═'*55}\n")
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  10. MAIN
-# ══════════════════════════════════════════════════════════════════════════════
 
 MENU = """
-╔══════════════════════════════════════════════════════════════════╗
-║   PIPELINE DÉTECTION TUMEUR — RF + SVM — 24 features           ║
-╚══════════════════════════════════════════════════════════════════╝
+        détection tumeur
 """
 
 def main():
+    """
+    Point d'entree.
+    Arguments :
+      --train : lance la phase d'entrainement
+      --test  : lance la phase de test interactif
+    Si aucun argument : lance les deux.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--test',  action='store_true')
